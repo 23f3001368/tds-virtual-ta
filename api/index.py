@@ -1,4 +1,4 @@
-# api/index.py (FINAL, CORRECTED APPLICATION CODE)
+# api/index.py (FINAL APPLICATION CODE)
 
 import os
 import base64
@@ -31,7 +31,7 @@ class APIResponse(BaseModel):
     answer: str
     links: List[Link]
 
-app = FastAPI(title="TDS Virtual TA", version="5.0.0-final")
+app = FastAPI(title="TDS Virtual TA", version="4.1.0-lazy-init")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- LAZY INITIALIZATION SETUP ---
@@ -63,23 +63,15 @@ def get_retrieval_chain():
     vector_store = PineconeVectorStore.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
     llm = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.0, openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     
-    # --- Build RAG Chain ---
+    # Build RAG Chain
     retriever = vector_store.as_retriever(search_kwargs={'k': 5})
-    
-    # THE FIX IS HERE: We added the {context} placeholder.
     system_prompt = (
         "You are a helpful virtual TA for the 'Tools in Data Science' course. "
         "Answer the student's question based *only* on the provided context. "
         "Your answer must be concise and accurate. Do not mention 'the context'. "
-        "If the context does not contain the answer, state that you could not find a definitive answer.\n\n"
-        "CONTEXT:\n{context}"
+        "If the context does not contain the answer, state that you could not find a definitive answer."
     )
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{input}"),
-    ])
-    
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
     
     # Store the chain in the global variable and return it
