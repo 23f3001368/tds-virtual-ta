@@ -6,24 +6,26 @@ from dotenv import load_dotenv
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_pinecone import PineconeVectorStore
 from langchain.docstore.document import Document
+from pinecone import Pinecone, ServerlessSpec
 
 load_dotenv()
 
 # --- Configuration ---
 DISCOURSE_DATA_DIR = "discourse_json"
 TDS_PAGES_DIR = "tds_pages_md"
-DATA_PATH = "data/processed_data.json"
-VECTOR_STORE_PATH = "data/faiss_index"
+PINECONE_INDEX_NAME = "tds-virtual-ta"
+# We will process and upload in batches of this size to avoid API limits.
+UPLOAD_BATCH_SIZE = 100
 
+# --- Data Parsing Functions (UNCHANGED) ---
 def parse_discourse_data() -> list:
     print(f"--- Parsing Discourse data from '{DISCOURSE_DATA_DIR}' ---")
     all_posts = []
     base_url = "https://discourse.onlinedegree.iitm.ac.in"
     if not os.path.isdir(DISCOURSE_DATA_DIR):
-        print(f"FATAL: Directory not found: '{DISCOURSE_DATA_DIR}'.")
-        return []
+        raise FileNotFoundError(f"Directory not found: '{DISCOURSE_DATA_DIR}'.")
     for filename in os.listdir(DISCOURSE_DATA_DIR):
         if filename.endswith(".json"):
             filepath = os.path.join(DISCOURSE_DATA_DIR, filename)
@@ -44,8 +46,7 @@ def parse_course_content_data() -> list:
     print(f"--- Parsing Course Content data from '{TDS_PAGES_DIR}' ---")
     all_pages = []
     if not os.path.isdir(TDS_PAGES_DIR):
-        print(f"FATAL: Directory not found: '{TDS_PAGES_DIR}'.")
-        return []
+        raise FileNotFoundError(f"Directory not found: '{TDS_PAGES_DIR}'.")
     for filename in os.listdir(TDS_PAGES_DIR):
         if filename.endswith(".md"):
             filepath = os.path.join(TDS_PAGES_DIR, filename)
@@ -57,42 +58,50 @@ def parse_course_content_data() -> list:
     return all_pages
 
 def run_preprocessing():
-    discourse_data = parse_discourse_data()
-    course_content_data = parse_course_content_data()
-    all_data = discourse_data + course_content_data
-    if not all_data:
-        print("FATAL: No data was processed. Halting.")
-        return
-    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-    with open(DATA_PATH, 'w', encoding='utf-8') as f:
-        json.dump(all_data, f, indent=2, ensure_ascii=False)
-    print(f"\nSaved {len(all_data)} total documents to {DATA_PATH}")
+    """
+    Processes data and uploads it to Pinecone in manageable batches.
+    """
+    # --- 1. Parsing & Chunking ---
+    all_data = parse_discourse_data() + parse_course_content_data()
+    if not all_data: return
 
     documents = [Document(page_content=item['content'], metadata={'source': item['url'], 'title': item['title']}) for item in all_data if item['content']]
-    print("\n--- Splitting Documents into Chunks ---")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
     chunks = text_splitter.split_documents(documents)
-    print(f"Split {len(documents)} documents into {len(chunks)} chunks.")
+    print(f"\nSplit {len(documents)} documents into {len(chunks)} chunks.")
 
-    print("\n--- Creating Embeddings via Proxy ---")
-    api_token = os.getenv("AIPIPE_TOKEN")
-    base_url = os.getenv("AIPIPE_BASE_URL")
-    if not api_token or not base_url:
-        raise ValueError("AIPIPE_TOKEN and AIPIPE_BASE_URL must be set in .env file.")
-        
-    embeddings = OpenAIEmbeddings(
-        # CORRECTED: Remove the 'openai/' prefix. The proxy expects the direct model name.
-        model="text-embedding-3-small",
-        openai_api_key=api_token,
-        openai_api_base=base_url
-    )
+    # --- 2. Initialize Clients ---
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
+    AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL")
+    if not all([PINECONE_API_KEY, AIPIPE_TOKEN, AIPIPE_BASE_URL]):
+        raise ValueError("One or more required environment variables are missing.")
     
-    print("This may take a few minutes...")
-    vector_store = FAISS.from_documents(chunks, embeddings)
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     
-    vector_store.save_local(VECTOR_STORE_PATH)
-    print(f"--- Vector store saved to {VECTOR_STORE_PATH} ---")
-    print("\nPreprocessing complete! Commit the 'data' directory and deploy.")
+    # --- 3. Create or Connect to Index ---
+    print(f"Checking for Pinecone index '{PINECONE_INDEX_NAME}'...")
+    if PINECONE_INDEX_NAME not in pc.list_indexes().names():
+        print(f"Creating new index '{PINECONE_INDEX_NAME}'...")
+        pc.create_index(name=PINECONE_INDEX_NAME, dimension=1536, metric='cosine', spec=ServerlessSpec(cloud='aws', region='us-east-1'))
+        print("Index created.")
+    else:
+        print("Index already exists.")
+
+    # --- 4. THE FIX: Upload in Batches ---
+    print(f"\nUploading documents to Pinecone in batches of {UPLOAD_BATCH_SIZE}...")
+    
+    # First, get a client pointed at the specific index
+    vectorstore = PineconeVectorStore(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
+
+    for i in range(0, len(chunks), UPLOAD_BATCH_SIZE):
+        batch = chunks[i:i + UPLOAD_BATCH_SIZE]
+        print(f"  - Uploading batch {i//UPLOAD_BATCH_SIZE + 1} ({len(batch)} chunks)...")
+        vectorstore.add_documents(batch)
+    
+    print("\n--- Preprocessing and upload complete! ---")
+    print("Your Pinecone index is now populated.")
 
 if __name__ == '__main__':
     run_preprocessing()
