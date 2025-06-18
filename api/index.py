@@ -1,4 +1,4 @@
-# api/index.py (FINAL, ROBUST-PARSING VERSION)
+# api/index.py (FINAL, DOUBLE-JSON-FIXED VERSION)
 
 import os
 import base64
@@ -19,7 +19,7 @@ from langchain_core.messages import HumanMessage
 
 load_dotenv()
 
-# --- Pydantic Models (for output validation only) ---
+# --- Pydantic Models ---
 class Link(BaseModel):
     url: str
     text: str
@@ -28,15 +28,10 @@ class APIResponse(BaseModel):
     answer: str
     links: List[Link]
 
-# We no longer use a Pydantic model for the incoming request
-# class APIRequest(BaseModel):
-#     question: str
-#     image: Optional[str] = None
-
-app = FastAPI(title="TDS Virtual TA", version="5.2.0-robust-parser", redirect_slashes=False)
+app = FastAPI(title="TDS Virtual TA", version="5.3.0-final", redirect_slashes=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# --- LAZY INITIALIZATION SETUP (UNCHANGED) ---
+# --- LAZY INITIALIZATION SETUP ---
 retrieval_chain = None
 
 def get_retrieval_chain():
@@ -44,15 +39,14 @@ def get_retrieval_chain():
     global retrieval_chain
     if retrieval_chain is not None:
         return retrieval_chain
-    print("--- Initializing RAG chain for the first time... ---")
+    print("--- Initializing RAG chain... ---")
     AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
     AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL")
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-    PINECONE_INDEX_NAME = "tds-virtual-ta"
     if not all([AIPIPE_TOKEN, AIPIPE_BASE_URL, PINECONE_API_KEY]):
-        raise RuntimeError("FATAL: Required environment variables are not set.")
+        raise RuntimeError("FATAL: Required env vars not set.")
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
-    vector_store = PineconeVectorStore.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
+    vector_store = PineconeVectorStore.from_existing_index(index_name="tds-virtual-ta", embedding=embeddings)
     llm = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.0, openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     retriever = vector_store.as_retriever(search_kwargs={'k': 5})
     system_prompt = ("You are a helpful virtual TA for 'Tools in Data Science'. "
@@ -63,7 +57,7 @@ def get_retrieval_chain():
     prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
     retrieval_chain = create_retrieval_chain(retriever, question_answer_chain)
-    print("--- RAG chain initialized successfully. ---")
+    print("--- RAG chain initialized. ---")
     return retrieval_chain
 
 def get_image_description(base64_image: str) -> str:
@@ -73,27 +67,16 @@ def get_image_description(base64_image: str) -> str:
     return msg.content
 
 @app.post("/api/", response_model=APIResponse)
-async def ask_question(request: Request): # Changed to use raw Request
-    # --- THE FIX IS HERE: Manual JSON Parsing ---
+async def ask_question(request: Request):
+    # --- Manual JSON Parsing (from previous fix) ---
     try:
-        # Get the raw body as bytes and decode it
         body_bytes = await request.body()
-        body_str = body_bytes.decode('utf-8')
-        
-        # The standard json library is more lenient than Pydantic's parser
-        data = json.loads(body_str)
-        
-        # Manually validate the required 'question' field
+        data = json.loads(body_bytes.decode('utf-8'))
         question = data.get("question")
-        if not question or not isinstance(question, str):
-            raise ValueError("'question' field is missing or not a string.")
-            
-        image = data.get("image") # Image is optional
-
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"Error decoding request body: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {e}")
-    # --- END OF FIX ---
+        if not question: raise ValueError("'question' field is missing.")
+        image = data.get("image")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
     try:
         chain = get_retrieval_chain()
@@ -103,28 +86,48 @@ async def ask_question(request: Request): # Changed to use raw Request
     if image and isinstance(image, str):
         try:
             image_description = get_image_description(image)
-            question = f"Question: '{question}'. This question relates to a screenshot showing: {image_description}"
+            question = f"Question: '{question}'. Screenshot context: {image_description}"
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to process image: {e}")
 
     try:
         response = await chain.ainvoke({"input": question})
-        answer_text = response.get('answer', "No answer could be generated.")
+        llm_output_text = response.get('answer', "No answer could be generated.")
         retrieved_docs = response.get('context', [])
         
-        links = []
-        unique_urls = set()
-        for doc in retrieved_docs:
-            url = doc.metadata.get('source')
-            if url and url not in unique_urls:
-                title = doc.metadata.get('title', 'Source Link')
-                links.append(Link(url=url, text=title[:90] + '...' if len(title) > 90 else title))
-                unique_urls.add(url)
+        # --- THE FIX IS HERE: Parse the LLM's output ---
+        final_answer = llm_output_text
+        final_links_data = []
         
-        return APIResponse(answer=answer_text, links=links[:3])
+        try:
+            # Try to parse the LLM output as JSON
+            parsed_data = json.loads(llm_output_text)
+            if isinstance(parsed_data, dict) and "answer" in parsed_data and "links" in parsed_data:
+                print("--- LLM returned a JSON object. Parsing it. ---")
+                final_answer = parsed_data["answer"]
+                final_links_data = parsed_data["links"]
+        except json.JSONDecodeError:
+            # If it's not JSON, it's a plain string. That's fine too.
+            print("--- LLM returned a plain string. ---")
+            pass
+
+        # Use the links from the parsed data if available, otherwise use the retrieved docs
+        if final_links_data:
+            links = [Link(**link_data) for link_data in final_links_data]
+        else:
+            links = []
+            unique_urls = set()
+            for doc in retrieved_docs:
+                url = doc.metadata.get('source')
+                if url and url not in unique_urls:
+                    title = doc.metadata.get('title', 'Source Link')
+                    links.append(Link(url=url, text=title[:90] + '...' if len(title) > 90 else title))
+                    unique_urls.add(url)
+        
+        return APIResponse(answer=final_answer, links=links[:3])
     except Exception as e:
-        raise HTTPException(status_code=500, detail="An error occurred during question processing.")
+        raise HTTPException(status_code=500, detail=f"Error during RAG chain invocation: {e}")
 
 @app.get("/")
 def read_root():
-    return {"message": "TDS Virtual TA is running. POST to /api/ with your question."}
+    return {"message": "TDS Virtual TA is running."}
