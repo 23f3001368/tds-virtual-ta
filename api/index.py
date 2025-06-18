@@ -1,4 +1,4 @@
-# api/index.py (FINAL, CORRECTED APPLICATION CODE)
+# api/index.py (FINAL, PRODUCTION-READY CODE)
 
 import os
 import base64
@@ -31,42 +31,37 @@ class APIResponse(BaseModel):
     answer: str
     links: List[Link]
 
-app = FastAPI(title="TDS Virtual TA", version="5.0.0-final")
+# THE FIX IS HERE: Add `redirect_slashes=False` to the constructor.
+# This makes the API accept both /api and /api/ without redirecting.
+app = FastAPI(title="TDS Virtual TA", version="5.1.0-final", redirect_slashes=False)
+
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- LAZY INITIALIZATION SETUP ---
 retrieval_chain = None
 
 def get_retrieval_chain():
-    """
-    Initializes and returns the RAG chain. Uses a global variable
-    to ensure it's only created once.
-    """
+    """Initializes and returns the RAG chain, created only once."""
     global retrieval_chain
     if retrieval_chain is not None:
-        print("--- Using existing RAG chain. ---")
         return retrieval_chain
 
     print("--- Initializing RAG chain for the first time... ---")
     
-    # Load all required API Keys
+    # Load all required API Keys from environment
     AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
     AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL")
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_INDEX_NAME = "tds-virtual-ta"
 
     if not all([AIPIPE_TOKEN, AIPIPE_BASE_URL, PINECONE_API_KEY]):
-        raise RuntimeError("FATAL: One or more required environment variables are not set on the server.")
+        raise RuntimeError("FATAL: Required environment variables are not set on the server.")
 
-    # Initialize all clients
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     vector_store = PineconeVectorStore.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
     llm = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.0, openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     
-    # --- Build RAG Chain ---
     retriever = vector_store.as_retriever(search_kwargs={'k': 5})
-    
-    # THE FIX IS HERE: We added the {context} placeholder.
     system_prompt = (
         "You are a helpful virtual TA for the 'Tools in Data Science' course. "
         "Answer the student's question based *only* on the provided context. "
@@ -74,27 +69,15 @@ def get_retrieval_chain():
         "If the context does not contain the answer, state that you could not find a definitive answer.\n\n"
         "CONTEXT:\n{context}"
     )
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{input}"),
-    ])
-    
+    prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
     
-    # Store the chain in the global variable and return it
     retrieval_chain = create_retrieval_chain(retriever, question_answer_chain)
     print("--- RAG chain initialized successfully. ---")
     return retrieval_chain
 
 def get_image_description(base64_image: str) -> str:
-    vision_llm = ChatOpenAI(
-        model="gpt-4o-mini", 
-        temperature=0, 
-        max_tokens=200, 
-        openai_api_key=os.getenv("AIPIPE_TOKEN"),
-        openai_api_base=os.getenv("AIPIPE_BASE_URL")
-    )
+    vision_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=200, openai_api_key=os.getenv("AIPIPE_TOKEN"), openai_api_base=os.getenv("AIPIPE_BASE_URL"))
     vision_prompt = "Analyze this screenshot. Concisely describe any code, commands, or errors shown."
     msg = vision_llm.invoke([HumanMessage(content=[{"type": "text", "text": vision_prompt}, {"type": "image_url", "image_url": {"url": f"data:image/webp;base64,{base64_image}"}}])])
     return msg.content
@@ -104,7 +87,6 @@ async def ask_question(request: APIRequest):
     try:
         chain = get_retrieval_chain()
     except Exception as e:
-        print(f"FATAL: Could not initialize RAG chain: {e}")
         raise HTTPException(status_code=500, detail=f"Could not initialize RAG chain: {e}")
 
     question = request.question
@@ -130,9 +112,7 @@ async def ask_question(request: APIRequest):
                 unique_urls.add(url)
         
         return APIResponse(answer=answer_text, links=links[:3])
-
     except Exception as e:
-        print(f"Error during RAG chain invocation: {e}")
         raise HTTPException(status_code=500, detail="An error occurred during question processing.")
 
 @app.get("/")
