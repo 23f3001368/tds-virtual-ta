@@ -1,10 +1,11 @@
-# api/index.py (FINAL, DOUBLE-JSON-FIXED VERSION)
+# api/index.py (FINAL, BULLETPROOF VERSION)
 
 import os
 import base64
 import json
+import re
 from typing import List, Optional
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,18 +29,19 @@ class APIResponse(BaseModel):
     answer: str
     links: List[Link]
 
-app = FastAPI(title="TDS Virtual TA", version="5.3.0-final", redirect_slashes=False)
+app = FastAPI(title="TDS Virtual TA", version="5.4.0-bulletproof", redirect_slashes=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- LAZY INITIALIZATION SETUP ---
 retrieval_chain = None
 
 def get_retrieval_chain():
-    """Initializes and returns the RAG chain, created only once."""
+    # This function is correct and does not need changes.
     global retrieval_chain
     if retrieval_chain is not None:
         return retrieval_chain
     print("--- Initializing RAG chain... ---")
+    # ... (rest of the function is the same)
     AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
     AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL")
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -61,59 +63,56 @@ def get_retrieval_chain():
     return retrieval_chain
 
 def get_image_description(base64_image: str) -> str:
+    # This function is correct and does not need changes.
     vision_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=200, openai_api_key=os.getenv("AIPIPE_TOKEN"), openai_api_base=os.getenv("AIPIPE_BASE_URL"))
     vision_prompt = "Analyze this screenshot. Concisely describe any code, commands, or errors shown."
     msg = vision_llm.invoke([HumanMessage(content=[{"type": "text", "text": vision_prompt}, {"type": "image_url", "image_url": {"url": f"data:image/webp;base64,{base64_image}"}}])])
     return msg.content
 
+def robust_json_load(s: str) -> dict:
+    """
+    A more robust JSON loader that tries to fix common errors like trailing commas.
+    """
+    # Remove trailing commas before closing braces and brackets
+    s = re.sub(r',\s*([}\]])', r'\1', s)
+    return json.loads(s)
+
 @app.post("/api/", response_model=APIResponse)
 async def ask_question(request: Request):
-    # --- Manual JSON Parsing (from previous fix) ---
+    # --- Manual, Robust JSON Parsing ---
     try:
-        body_bytes = await request.body()
-        data = json.loads(body_bytes.decode('utf-8'))
+        body_str = (await request.body()).decode('utf-8')
+        data = robust_json_load(body_str)
         question = data.get("question")
         if not question: raise ValueError("'question' field is missing.")
         image = data.get("image")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid or malformed JSON request body: {e}")
 
+    # --- RAG Chain and Image Processing ---
     try:
         chain = get_retrieval_chain()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not initialize RAG chain: {e}")
-
-    if image and isinstance(image, str):
-        try:
+        if image and isinstance(image, str):
             image_description = get_image_description(image)
             question = f"Question: '{question}'. Screenshot context: {image_description}"
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to process image: {e}")
-
-    try:
+        
         response = await chain.ainvoke({"input": question})
-        llm_output_text = response.get('answer', "No answer could be generated.")
+        answer_text = response.get('answer', "No answer could be generated.")
         retrieved_docs = response.get('context', [])
         
-        # --- THE FIX IS HERE: Parse the LLM's output ---
-        final_answer = llm_output_text
-        final_links_data = []
-        
+        # --- Intelligent Response Parsing (from previous fix) ---
+        final_answer = answer_text
+        links_data = []
         try:
-            # Try to parse the LLM output as JSON
-            parsed_data = json.loads(llm_output_text)
-            if isinstance(parsed_data, dict) and "answer" in parsed_data and "links" in parsed_data:
-                print("--- LLM returned a JSON object. Parsing it. ---")
-                final_answer = parsed_data["answer"]
-                final_links_data = parsed_data["links"]
+            parsed_data = json.loads(answer_text)
+            if isinstance(parsed_data, dict) and "answer" in parsed_data:
+                final_answer = parsed_data.get("answer")
+                links_data = parsed_data.get("links", [])
         except json.JSONDecodeError:
-            # If it's not JSON, it's a plain string. That's fine too.
-            print("--- LLM returned a plain string. ---")
             pass
 
-        # Use the links from the parsed data if available, otherwise use the retrieved docs
-        if final_links_data:
-            links = [Link(**link_data) for link_data in final_links_data]
+        if links_data:
+            links = [Link(**link_data) for link_data in links_data]
         else:
             links = []
             unique_urls = set()
@@ -121,12 +120,15 @@ async def ask_question(request: Request):
                 url = doc.metadata.get('source')
                 if url and url not in unique_urls:
                     title = doc.metadata.get('title', 'Source Link')
-                    links.append(Link(url=url, text=title[:90] + '...' if len(title) > 90 else title))
+                    links.append(Link(url=url, text=title[:90]))
                     unique_urls.add(url)
         
         return APIResponse(answer=final_answer, links=links[:3])
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during RAG chain invocation: {e}")
+        # Catch any other unexpected error during processing
+        print(f"UNEXPECTED SERVER ERROR: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 @app.get("/")
 def read_root():
