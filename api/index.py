@@ -30,50 +30,41 @@ class APIResponse(BaseModel):
     answer: str
     links: List[Link]
 
-app = FastAPI(title="TDS Virtual TA", version="4.0.0-Pinecone")
+app = FastAPI(title="TDS Virtual TA", version="4.1.0-lazy-init")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# --- LAZY INITIALIZATION SETUP ---
+# We declare the global variable but leave it empty.
+# It will be initialized only on the first API call.
 retrieval_chain = None
 
-@app.on_event("startup")
-def load_models_and_index():
+def get_retrieval_chain():
     """
-    On startup, this function now connects to the remote Pinecone index.
-    No local files are needed.
+    Initializes and returns the RAG chain. Uses a global variable
+    to ensure it's only created once.
     """
     global retrieval_chain
+    if retrieval_chain is not None:
+        print("--- Using existing RAG chain. ---")
+        return retrieval_chain
+
+    print("--- Initializing RAG chain for the first time... ---")
     
     # --- Load API Keys ---
     AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
     AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL")
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") # Pinecone key is now needed here too
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_INDEX_NAME = "tds-virtual-ta"
 
     if not all([AIPIPE_TOKEN, AIPIPE_BASE_URL, PINECONE_API_KEY]):
         raise RuntimeError("FATAL: Required environment variables are not set.")
 
-    # --- 1. Initialize Embedding Model ---
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small", 
-        openai_api_key=AIPIPE_TOKEN, 
-        openai_api_base=AIPIPE_BASE_URL
-    )
-
-    # --- 2. Connect to the existing Pinecone index ---
-    print(f"--- Connecting to Pinecone index: {PINECONE_INDEX_NAME} ---")
-    vector_store = PineconeVectorStore.from_existing_index(
-        index_name=PINECONE_INDEX_NAME,
-        embedding=embeddings
-    )
-    print("--- Connection to Pinecone successful. ---")
+    # --- 1. Initialize Models and Connect to Pinecone ---
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
+    vector_store = PineconeVectorStore.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
+    llm = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.0, openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     
-    # --- 3. RAG Chain Setup (Works seamlessly with the Pinecone vector store) ---
-    llm = ChatOpenAI(
-        model="gpt-3.5-turbo-0125", 
-        temperature=0.0, 
-        openai_api_key=AIPIPE_TOKEN, 
-        openai_api_base=AIPIPE_BASE_URL
-    )
+    # --- 2. Build RAG Chain ---
     retriever = vector_store.as_retriever(search_kwargs={'k': 5})
     system_prompt = (
         "You are a helpful virtual TA for the 'Tools in Data Science' course. "
@@ -83,11 +74,13 @@ def load_models_and_index():
     )
     prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    retrieval_chain = create_retrieval_chain(retriever, question_answer_chain)
     
-    print("--- TDS Virtual TA is ready to answer questions. ---")
+    # --- 3. Store the chain in the global variable and return it ---
+    retrieval_chain = create_retrieval_chain(retriever, question_answer_chain)
+    print("--- RAG chain initialized successfully. ---")
+    return retrieval_chain
 
-# --- get_image_description, ask_question, read_root are UNCHANGED ---
+# This function remains for vision calls, it's lightweight.
 def get_image_description(base64_image: str) -> str:
     vision_llm = ChatOpenAI(
         model="gpt-4o-mini", 
@@ -102,8 +95,13 @@ def get_image_description(base64_image: str) -> str:
 
 @app.post("/api/", response_model=APIResponse)
 async def ask_question(request: APIRequest):
-    if not retrieval_chain:
-        raise HTTPException(status_code=503, detail="Service not ready. Please try again.")
+    try:
+        # Get the chain. It will be created on the first call and reused on subsequent ones.
+        chain = get_retrieval_chain()
+    except Exception as e:
+        # If initialization itself fails, return a 500 error
+        print(f"FATAL: Could not initialize RAG chain: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not initialize RAG chain: {e}")
 
     question = request.question
     if request.image:
@@ -114,7 +112,7 @@ async def ask_question(request: APIRequest):
             raise HTTPException(status_code=500, detail=f"Failed to process image: {e}")
 
     try:
-        response = retrieval_chain.invoke({"input": question})
+        response = await chain.ainvoke({"input": question}) # Use async invoke
         answer_text = response.get('answer', "No answer could be generated.")
         retrieved_docs = response.get('context', [])
         
@@ -131,7 +129,7 @@ async def ask_question(request: APIRequest):
 
     except Exception as e:
         print(f"Error during RAG chain invocation: {e}")
-        raise HTTPException(status_code=500, detail="An error occurred.")
+        raise HTTPException(status_code=500, detail="An error occurred during question processing.")
 
 @app.get("/")
 def read_root():
