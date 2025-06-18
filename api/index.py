@@ -2,46 +2,71 @@
 
 import os
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+# We only import the Pinecone library for this test
 from pinecone import Pinecone
 
 load_dotenv()
 
 app = FastAPI()
 
-@app.get("/api/test-connection")
-def test_connection():
+# Add CORS middleware so the evaluator website can call it
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/api/test")
+def run_connection_test():
     """
-    This endpoint does only one thing: tests the Pinecone API key.
-    It will either return a success message or the exact error.
+    This simple endpoint will try to connect to Pinecone.
+    It is designed to ALWAYS return a JSON response, either success or failure.
+    This will tell us exactly what the error is.
     """
-    print("--- Test endpoint hit. Attempting to connect to Pinecone. ---")
-    
+    print("--- DIAGNOSTIC: Test endpoint has been called. ---")
+
+    # 1. Check if the Environment Variable exists on Vercel
     pinecone_api_key = os.getenv("PINECONE_API_KEY")
-
     if not pinecone_api_key:
-        print("FATAL: PINECONE_API_KEY environment variable is NOT SET.")
-        raise HTTPException(status_code=500, detail="Server is missing PINECONE_API_KEY.")
+        print("--- DIAGNOSTIC: FAILURE! The PINECONE_API_KEY environment variable was not found on the server.")
+        raise HTTPException(
+            status_code=500, 
+            detail="Server configuration error: PINECONE_API_KEY environment variable is not set."
+        )
 
+    print("--- DIAGNOSTIC: PINECONE_API_KEY found. Proceeding to connect. ---")
+
+    # 2. Try to connect to Pinecone and list indexes
     try:
-        print(f"Initializing Pinecone client...")
         pc = Pinecone(api_key=pinecone_api_key)
+        print("--- DIAGNOSTIC: Pinecone client initialized. Listing indexes... ---")
         
-        print("Successfully initialized client. Fetching index list...")
-        indexes = pc.list_indexes().names()
+        # This is the actual network call that might be failing
+        list_of_indexes = pc.list_indexes().names()
         
-        print(f"Successfully connected. Found indexes: {indexes}")
+        success_message = f"Successfully connected to Pinecone. Found indexes: {list_of_indexes}"
+        print(f"--- DIAGNOSTIC: SUCCESS! {success_message} ---")
+        
         return {
             "status": "SUCCESS",
-            "message": "Successfully connected to Pinecone and listed indexes.",
-            "found_indexes": indexes
+            "message": success_message
         }
     except Exception as e:
-        # This is the most important part: we catch the error and RETURN it.
-        error_message = f"Failed to connect to Pinecone. Error: {str(e)}"
-        print(f"FATAL: {error_message}")
-        raise HTTPException(status_code=500, detail=error_message)
+        # If ANY error happens during the connection, catch it and return it
+        error_message = f"An error occurred while connecting to Pinecone. ERROR: {str(e)}"
+        print(f"--- DIAGNOSTIC: FAILURE! {error_message} ---")
+        raise HTTPException(
+            status_code=500,
+            detail=error_message
+        )
 
 @app.get("/")
 def read_root():
-    return {"message": "Diagnostic API is running. Hit /api/test-connection to debug."}
+    return {"message": "Diagnostic API is running. Hit /api/test to debug."}
+    
