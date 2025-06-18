@@ -1,11 +1,12 @@
-# api/index.py (FINAL, PRODUCTION-READY CODE)
+# api/index.py (FINAL, ROBUST-PARSING VERSION)
 
 import os
 import base64
+import json
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -18,11 +19,7 @@ from langchain_core.messages import HumanMessage
 
 load_dotenv()
 
-# --- Pydantic Models ---
-class APIRequest(BaseModel):
-    question: str
-    image: Optional[str] = None
-
+# --- Pydantic Models (for output validation only) ---
 class Link(BaseModel):
     url: str
     text: str
@@ -31,13 +28,15 @@ class APIResponse(BaseModel):
     answer: str
     links: List[Link]
 
-# THE FIX IS HERE: Add `redirect_slashes=False` to the constructor.
-# This makes the API accept both /api and /api/ without redirecting.
-app = FastAPI(title="TDS Virtual TA", version="5.1.0-final", redirect_slashes=False)
+# We no longer use a Pydantic model for the incoming request
+# class APIRequest(BaseModel):
+#     question: str
+#     image: Optional[str] = None
 
+app = FastAPI(title="TDS Virtual TA", version="5.2.0-robust-parser", redirect_slashes=False)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# --- LAZY INITIALIZATION SETUP ---
+# --- LAZY INITIALIZATION SETUP (UNCHANGED) ---
 retrieval_chain = None
 
 def get_retrieval_chain():
@@ -45,33 +44,24 @@ def get_retrieval_chain():
     global retrieval_chain
     if retrieval_chain is not None:
         return retrieval_chain
-
     print("--- Initializing RAG chain for the first time... ---")
-    
-    # Load all required API Keys from environment
     AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
     AIPIPE_BASE_URL = os.getenv("AIPIPE_BASE_URL")
     PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
     PINECONE_INDEX_NAME = "tds-virtual-ta"
-
     if not all([AIPIPE_TOKEN, AIPIPE_BASE_URL, PINECONE_API_KEY]):
-        raise RuntimeError("FATAL: Required environment variables are not set on the server.")
-
+        raise RuntimeError("FATAL: Required environment variables are not set.")
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
     vector_store = PineconeVectorStore.from_existing_index(index_name=PINECONE_INDEX_NAME, embedding=embeddings)
     llm = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.0, openai_api_key=AIPIPE_TOKEN, openai_api_base=AIPIPE_BASE_URL)
-    
     retriever = vector_store.as_retriever(search_kwargs={'k': 5})
-    system_prompt = (
-        "You are a helpful virtual TA for the 'Tools in Data Science' course. "
-        "Answer the student's question based *only* on the provided context. "
-        "Your answer must be concise and accurate. Do not mention 'the context'. "
-        "If the context does not contain the answer, state that you could not find a definitive answer.\n\n"
-        "CONTEXT:\n{context}"
-    )
+    system_prompt = ("You are a helpful virtual TA for 'Tools in Data Science'. "
+                   "Answer the student's question based *only* on the provided context. "
+                   "Your answer must be concise and accurate. Do not mention 'the context'. "
+                   "If the context is insufficient, state that you could not find a definitive answer.\n\n"
+                   "CONTEXT:\n{context}")
     prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
     question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    
     retrieval_chain = create_retrieval_chain(retriever, question_answer_chain)
     print("--- RAG chain initialized successfully. ---")
     return retrieval_chain
@@ -83,16 +73,36 @@ def get_image_description(base64_image: str) -> str:
     return msg.content
 
 @app.post("/api/", response_model=APIResponse)
-async def ask_question(request: APIRequest):
+async def ask_question(request: Request): # Changed to use raw Request
+    # --- THE FIX IS HERE: Manual JSON Parsing ---
+    try:
+        # Get the raw body as bytes and decode it
+        body_bytes = await request.body()
+        body_str = body_bytes.decode('utf-8')
+        
+        # The standard json library is more lenient than Pydantic's parser
+        data = json.loads(body_str)
+        
+        # Manually validate the required 'question' field
+        question = data.get("question")
+        if not question or not isinstance(question, str):
+            raise ValueError("'question' field is missing or not a string.")
+            
+        image = data.get("image") # Image is optional
+
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Error decoding request body: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {e}")
+    # --- END OF FIX ---
+
     try:
         chain = get_retrieval_chain()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not initialize RAG chain: {e}")
 
-    question = request.question
-    if request.image:
+    if image and isinstance(image, str):
         try:
-            image_description = get_image_description(request.image)
+            image_description = get_image_description(image)
             question = f"Question: '{question}'. This question relates to a screenshot showing: {image_description}"
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to process image: {e}")
