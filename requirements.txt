@@ -4,6 +4,7 @@ pydantic
 langchain
 langchain-openai
 beautifulsoup4
-faiss-cpu
 python-dotenv
 tiktoken
+pinecone-client
+langchain-pinecone
